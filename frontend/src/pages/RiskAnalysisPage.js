@@ -102,17 +102,41 @@ const defaultRiskData = {
 };
 
 function RiskAnalysisPage() {
-  const [riskData, setRiskData] = useState(defaultRiskData);
+  const [riskData, setRiskData] = useState(null);
   const [aiInsight, setAiInsight] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     requestJson("/api/risk")
-      .then((data) => setRiskData(data))
-      .catch(() => {});
+      .then((data) => {
+        setRiskData(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setRiskData(defaultRiskData);
+        setLoading(false);
+      });
+      
     requestJson("/api/ai/risk-explanation", { method: "POST" })
       .then((data) => setAiInsight(data))
       .catch(() => {});
   }, []);
+
+  if (loading) {
+    return (
+      <>
+        <Navbar />
+        <main style={{ ...styles.page, display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" }}>
+          <div style={{ textAlign: "center", color: "#64748b", fontSize: "18px", fontWeight: "500" }}>
+            <div style={{ width: "40px", height: "40px", border: "3px solid #e2e8f0", borderTopColor: "#3b82f6", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }}></div>
+            <style>{"@keyframes spin { 100% { transform: rotate(360deg); } }"}</style>
+            Analyzing your risk profile...
+          </div>
+        </main>
+        <Footer />
+      </>
+    );
+  }
 
   return (
     <>

@@ -36,19 +36,42 @@ const defaultReportsData = {
 function ReportsPage() {
   const { isTablet, isMobile } = useViewport();
   const [sections, setSections] = useState(defaultSections);
-  const [reportsData, setReportsData] = useState(defaultReportsData);
+  const [reportsData, setReportsData] = useState(null);
   const [formData, setFormData] = useState({
     format: "PDF Document",
     date_range: "Last Month",
   });
   const [message, setMessage] = useState("");
   const [aiInsight, setAiInsight] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     requestJson("/api/reports")
-      .then((data) => setReportsData(data))
-      .catch(() => {});
+      .then((data) => {
+        setReportsData(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setReportsData(defaultReportsData);
+        setLoading(false);
+      });
   }, []);
+
+  if (loading) {
+    return (
+      <>
+        <Navbar />
+        <main style={{ ...styles.page, display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" }}>
+          <div style={{ textAlign: "center", color: "#64748b", fontSize: "18px", fontWeight: "500" }}>
+            <div style={{ width: "40px", height: "40px", border: "3px solid #e2e8f0", borderTopColor: "#3b82f6", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }}></div>
+            <style>{"@keyframes spin { 100% { transform: rotate(360deg); } }"}</style>
+            Loading your reports...
+          </div>
+        </main>
+        <Footer />
+      </>
+    );
+  }
 
   function toggleSection(title) {
     setSections((current) =>

@@ -17,15 +17,38 @@ const defaultProfile = {
 
 function ProfilePage() {
   const { isTablet, isMobile } = useViewport();
-  const [profile, setProfile] = useState(defaultProfile);
+  const [profile, setProfile] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
   const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     requestJson("/api/profile/me")
-      .then((data) => setProfile(data))
-      .catch(() => {});
+      .then((data) => {
+        setProfile(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setProfile(defaultProfile);
+        setLoading(false);
+      });
   }, []);
+
+  if (loading) {
+    return (
+      <>
+        <Navbar />
+        <main style={{ ...styles.page, display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" }}>
+          <div style={{ textAlign: "center", color: "#64748b", fontSize: "18px", fontWeight: "500" }}>
+            <div style={{ width: "40px", height: "40px", border: "3px solid #e2e8f0", borderTopColor: "#3b82f6", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }}></div>
+            <style>{"@keyframes spin { 100% { transform: rotate(360deg); } }"}</style>
+            Loading profile...
+          </div>
+        </main>
+        <Footer />
+      </>
+    );
+  }
 
   function updateField(event) {
     setProfile((current) => ({

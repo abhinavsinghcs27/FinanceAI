@@ -66,20 +66,43 @@ const defaultRecommendations = {
 };
 
 function RecommendationsPage() {
-  const [recommendationData, setRecommendationData] = useState(defaultRecommendations);
+  const [recommendationData, setRecommendationData] = useState(null);
   const [aiInsight, setAiInsight] = useState(null);
   const [activeFilter, setActiveFilter] = useState("AI Picks");
   const [selectedStock, setSelectedStock] = useState(null);
   const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     requestJson("/api/recommendations")
-      .then((data) => setRecommendationData(data))
-      .catch(() => {});
+      .then((data) => {
+        setRecommendationData(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setRecommendationData(defaultRecommendations);
+        setLoading(false);
+      });
     requestJson("/api/ai/recommendations", { method: "POST" })
       .then((data) => setAiInsight(data))
       .catch(() => {});
   }, []);
+
+  if (loading) {
+    return (
+      <>
+        <Navbar />
+        <main style={{ ...styles.page, display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" }}>
+          <div style={{ textAlign: "center", color: "#64748b", fontSize: "18px", fontWeight: "500" }}>
+            <div style={{ width: "40px", height: "40px", border: "3px solid #e2e8f0", borderTopColor: "#3b82f6", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }}></div>
+            <style>{"@keyframes spin { 100% { transform: rotate(360deg); } }"}</style>
+            Loading recommendations...
+          </div>
+        </main>
+        <Footer />
+      </>
+    );
+  }
 
   async function addToWatchlist(ticker) {
     try {

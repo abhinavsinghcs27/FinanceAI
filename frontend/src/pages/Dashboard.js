@@ -70,17 +70,40 @@ const defaultDashboard = {
 
 function Dashboard() {
   const { isTablet, isMobile } = useViewport();
-  const [dashboardData, setDashboardData] = useState(defaultDashboard);
+  const [dashboardData, setDashboardData] = useState(null);
   const [aiInsight, setAiInsight] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     requestJson("/api/dashboard")
-      .then((data) => setDashboardData(data))
-      .catch(() => {});
+      .then((data) => {
+        setDashboardData(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setDashboardData(defaultDashboard);
+        setLoading(false);
+      });
     requestJson("/api/ai/portfolio-summary", { method: "POST" })
       .then((data) => setAiInsight(data))
       .catch(() => {});
   }, []);
+
+  if (loading) {
+    return (
+      <>
+        <Navbar />
+        <div style={{ ...styles.page, display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" }}>
+          <div style={{ textAlign: "center", color: "#64748b", fontSize: "18px", fontWeight: "500" }}>
+            <div style={{ width: "40px", height: "40px", border: "3px solid #e2e8f0", borderTopColor: "#3b82f6", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }}></div>
+            <style>{"@keyframes spin { 100% { transform: rotate(360deg); } }"}</style>
+            Loading dashboard data...
+          </div>
+        </div>
+        <Footer />
+      </>
+    );
+  }
 
   return (
     <>
