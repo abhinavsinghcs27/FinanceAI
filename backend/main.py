@@ -4,18 +4,56 @@ import csv
 import hashlib
 import hmac
 import io
+import json
+import os
 import secrets
 import sqlite3
-from datetime import UTC, datetime
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
+try:
+    from openpyxl import Workbook, load_workbook
+except ImportError:  # pragma: no cover - optional dependency fallback
+    Workbook = None
+    load_workbook = None
 
-DB_PATH = Path(__file__).with_name("financeai.db")
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+except ImportError:  # pragma: no cover - optional dependency fallback
+    letter = None
+    canvas = None
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = Path(os.getenv("FINANCEAI_DB_PATH", BASE_DIR / "financeai.db"))
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
+REPORTS_DIR = Path(os.getenv("FINANCEAI_REPORTS_DIR", BASE_DIR / "generated_reports"))
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+REPORT_FROM_EMAIL = os.getenv("REPORT_FROM_EMAIL", "reports@financeai.local")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+SEED_DEMO_DATA = os.getenv("SEED_DEMO_DATA", "true").lower() not in {"0", "false", "no"}
+AI_DISCLAIMER = (
+    "AI insights are educational and are not financial, investment, tax, or legal advice."
+)
 TEMPLATES = [
     {"title": "Monthly Summary", "subtitle": "Performance and holdings"},
     {"title": "Tax Report", "subtitle": "Capital gains and losses"},
@@ -75,12 +113,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,6 +150,24 @@ class ReportGenerateRequest(BaseModel):
 class EmailReportRequest(BaseModel):
     email: EmailStr
     report_name: str
+
+
+class AIChatRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=800)
+
+
+class AIReportInsightRequest(BaseModel):
+    format: str = "PDF Document"
+    date_range: str = "Last Month"
+    sections: list[str] = Field(default_factory=list)
+
+
+class TransactionRequest(BaseModel):
+    date: str
+    type: str
+    symbol: str
+    quantity: float = Field(gt=0)
+    price: float = Field(gt=0)
 
 
 def utc_now_iso() -> str:
@@ -171,6 +222,11 @@ def create_session(connection: sqlite3.Connection, user_id: int) -> str:
     return token
 
 
+def parse_iso_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 def resolve_asset(symbol: str) -> dict[str, Any]:
     asset = PRICE_BOOK.get(symbol.upper())
     if asset:
@@ -205,9 +261,9 @@ def current_user(
 
     token = authorization.removeprefix("Bearer ").strip()
     with get_db() as connection:
-        user = connection.execute(
+        row = connection.execute(
             """
-            SELECT users.*
+            SELECT users.*, sessions.created_at AS session_created_at
             FROM sessions
             JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ?
@@ -215,10 +271,17 @@ def current_user(
             (token,),
         ).fetchone()
 
-    if not user:
+        if row:
+            session_age = datetime.now(UTC) - parse_iso_datetime(row["session_created_at"])
+            if session_age > timedelta(hours=SESSION_TTL_HOURS):
+                connection.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                connection.commit()
+                row = None
+
+    if not row:
         raise HTTPException(status_code=401, detail="Invalid or expired session.")
 
-    return {"token": token, "user": user}
+    return {"token": token, "user": row}
 
 
 def fetch_transactions(connection: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
@@ -531,6 +594,136 @@ def fetch_watchlist(connection: sqlite3.Connection, user_id: int) -> list[str]:
     return [row["symbol"] for row in rows]
 
 
+def ai_context(connection: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
+    holdings = position_snapshot(connection, user)
+    risk = risk_payload(connection, user)
+    dashboard = dashboard_payload(connection, user)
+    recommendations = recommendations_payload(connection, user)
+    return {
+        "user": {
+            "risk_preference": user["risk_preference"],
+            "primary_goal": user["primary_goal"],
+            "base_currency": user["base_currency"],
+            "cash_balance": float(user["cash_balance"]),
+        },
+        "portfolio": {
+            "total_value": total_portfolio_value(holdings, user),
+            "holdings": [
+                {
+                    "symbol": item["symbol"],
+                    "company": item["company"],
+                    "sector": item["sector"],
+                    "quantity": round(item["quantity"], 4),
+                    "market_value": round(item["market_value"], 2),
+                    "gain_loss": round(item["gain_loss"], 2),
+                    "risk": item["risk"],
+                }
+                for item in holdings
+            ],
+            "allocation": dashboard["allocation"],
+        },
+        "risk": risk,
+        "recommendations": recommendations["stocks"],
+    }
+
+
+def rule_based_ai_insight(kind: str, context: dict[str, Any], question: str | None = None) -> dict[str, Any]:
+    holdings = context["portfolio"]["holdings"]
+    allocation = context["portfolio"]["allocation"]
+    risk = context["risk"]["score"]
+    largest_holding = max(holdings, key=lambda item: item["market_value"], default=None)
+    largest_allocation = max(allocation, key=lambda item: item["value"], default={"label": "Cash", "value": 0})
+    cash = next((item for item in allocation if item["label"] == "Cash"), {"value": 0})
+
+    top_actions = []
+    if largest_allocation["value"] >= 45:
+        top_actions.append(f"Review concentration in {largest_allocation['label']} before adding more exposure.")
+    if cash["value"] < 10:
+        top_actions.append("Rebuild a 10-15% cash buffer before taking larger new positions.")
+    if largest_holding:
+        top_actions.append(f"Stress test {largest_holding['symbol']} because it is the largest position by value.")
+    top_actions.append("Use staged entries for new investments instead of deploying all cash at once.")
+
+    summary = (
+        f"Your portfolio is currently rated {risk['label']} with a score of {risk['overall']}/100. "
+        f"The largest allocation bucket is {largest_allocation['label']} at {largest_allocation['value']}%."
+    )
+    if question:
+        summary = f"For your question, '{question}', the key issue is whether the portfolio still matches your stated goal and risk preference. {summary}"
+
+    return {
+        "source": "local_rules",
+        "summary": summary,
+        "key_points": [
+            f"Risk score: {risk['overall']}/100 versus recommended range {risk['recommended_range']}.",
+            f"Cash allocation: {cash['value']}%.",
+            f"Active holdings reviewed: {len(holdings)}.",
+        ],
+        "actions": top_actions[:4],
+        "disclaimer": AI_DISCLAIMER,
+    }
+
+
+def call_openai_insight(kind: str, context: dict[str, Any], question: str | None = None) -> dict[str, Any]:
+    if not OPENAI_API_KEY:
+        return rule_based_ai_insight(kind, context, question)
+
+    prompt = {
+        "task": kind,
+        "question": question,
+        "context": context,
+        "required_json_schema": {
+            "source": "openai",
+            "summary": "short paragraph",
+            "key_points": ["3 concise bullets"],
+            "actions": ["3 to 5 concrete next steps"],
+            "disclaimer": AI_DISCLAIMER,
+        },
+    }
+    body = json.dumps(
+        {
+            "model": AI_MODEL,
+            "instructions": (
+                "You are FinanceAI, an educational portfolio analysis assistant. "
+                "Do not give guaranteed returns or personalized licensed financial advice. "
+                "Be specific to the provided portfolio data. Return valid JSON only."
+            ),
+            "input": json.dumps(prompt),
+            "max_output_tokens": 700,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        text = raw.get("output_text", "")
+        if not text:
+            output = raw.get("output", [])
+            text = "".join(
+                content.get("text", "")
+                for item in output
+                for content in item.get("content", [])
+                if content.get("type") == "output_text"
+            )
+        parsed = json.loads(text)
+        parsed.setdefault("source", "openai")
+        parsed.setdefault("disclaimer", AI_DISCLAIMER)
+        return parsed
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError):
+        fallback = rule_based_ai_insight(kind, context, question)
+        fallback["source"] = "local_rules_after_ai_error"
+        return fallback
+
+
 def recommendation_description(sector: str, goal: str, is_watchlist: bool) -> str:
     if "growth" in goal.lower() and sector == "Technology":
         base = "Fits a growth-oriented portfolio with strong upside and durable product demand."
@@ -613,7 +806,7 @@ def recommendations_payload(connection: sqlite3.Connection, user: sqlite3.Row) -
 def reports_payload(connection: sqlite3.Connection, user_id: int) -> dict[str, Any]:
     recent_rows = connection.execute(
         """
-        SELECT title, meta
+        SELECT id, title, meta, content_type
         FROM reports
         WHERE user_id = ?
         ORDER BY created_at DESC, id DESC
@@ -647,7 +840,7 @@ def uploads_payload(connection: sqlite3.Connection, user_id: int) -> dict[str, A
 
 
 def coerce_transaction(row: dict[str, str]) -> dict[str, Any]:
-    normalized = {key.strip().lower(): value.strip() for key, value in row.items() if key and value}
+    normalized = {key.strip().lower(): str(value).strip() for key, value in row.items() if key and value is not None}
     if not normalized:
         raise ValueError("Encountered an empty row.")
     try:
@@ -673,6 +866,45 @@ def coerce_transaction(row: dict[str, str]) -> dict[str, Any]:
         "symbol": symbol,
         "quantity": quantity,
         "price": price,
+    }
+
+
+def parse_excel_transactions(contents: bytes) -> list[dict[str, Any]]:
+    if load_workbook is None:
+        raise ValueError("Excel parsing is not installed. Install openpyxl or upload CSV.")
+
+    workbook = load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+    worksheet = workbook.active
+    rows = list(worksheet.iter_rows(values_only=True))
+    if len(rows) < 2:
+        raise ValueError("Excel file must include a header row and at least one transaction.")
+
+    headers = [str(value).strip() if value is not None else "" for value in rows[0]]
+    parsed = []
+    for raw_row in rows[1:]:
+        item = {
+            headers[index]: raw_row[index]
+            for index in range(min(len(headers), len(raw_row)))
+            if headers[index]
+        }
+        if any(value is not None and str(value).strip() for value in item.values()):
+            parsed.append(coerce_transaction(item))
+
+    if not parsed:
+        raise ValueError("Excel file did not contain any transaction rows.")
+    return parsed
+
+
+def transaction_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "date": row["date"],
+        "type": row["type"],
+        "symbol": row["symbol"],
+        "quantity": row["quantity"],
+        "price": row["price"],
+        "source": row["source"],
+        "trade_value": round(float(row["quantity"]) * float(row["price"]), 2),
     }
 
 
@@ -769,6 +1001,172 @@ def insert_transactions(
             for item in parsed_rows[:3]
         ],
     }
+
+
+def insert_single_transaction(
+    connection: sqlite3.Connection,
+    user: sqlite3.Row,
+    payload: TransactionRequest,
+) -> dict[str, Any]:
+    transaction = coerce_transaction(
+        {
+            "date": payload.date,
+            "type": payload.type,
+            "symbol": payload.symbol,
+            "quantity": str(payload.quantity),
+            "price": str(payload.price),
+        }
+    )
+    validate_incoming_transactions(connection, user, [transaction])
+    trade_value = transaction["quantity"] * transaction["price"]
+    cash_balance = float(user["cash_balance"])
+    cash_balance = cash_balance - trade_value if transaction["type"] == "Buy" else cash_balance + trade_value
+
+    cursor = connection.execute(
+        """
+        INSERT INTO transactions (user_id, date, type, symbol, quantity, price, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user["id"],
+            transaction["date"],
+            transaction["type"],
+            transaction["symbol"],
+            transaction["quantity"],
+            transaction["price"],
+            "manual",
+        ),
+    )
+    connection.execute("UPDATE users SET cash_balance = ? WHERE id = ?", (cash_balance, user["id"]))
+    connection.commit()
+    row = connection.execute("SELECT * FROM transactions WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return transaction_payload(row)
+
+
+def generated_report_name(report_id: int, report_format: str) -> tuple[str, str]:
+    normalized = report_format.lower()
+    if "excel" in normalized:
+        return f"financeai-report-{report_id}.xlsx", (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    if "csv" in normalized:
+        return f"financeai-report-{report_id}.csv", "text/csv"
+    return f"financeai-report-{report_id}.pdf", "application/pdf"
+
+
+def report_lines(connection: sqlite3.Connection, user: sqlite3.Row, sections: list[str]) -> list[str]:
+    holdings = position_snapshot(connection, user)
+    risk = risk_payload(connection, user)
+    dashboard = dashboard_payload(connection, user)
+    lines = [
+        "FinanceAI Portfolio Report",
+        f"Generated: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Investor goal: {user['primary_goal']}",
+        f"Risk preference: {user['risk_preference']}",
+        f"Total value: {currency(total_portfolio_value(holdings, user))}",
+        f"Overall risk: {risk['score']['overall']}/100 ({risk['score']['label']})",
+        "",
+    ]
+    if not sections or "Current Holdings" in sections or "Portfolio Summary" in sections:
+        lines.append("Holdings")
+        for item in holdings:
+            lines.append(
+                f"- {item['symbol']} | {item['company']} | {currency(item['market_value'])} | "
+                f"Gain/Loss {currency(item['gain_loss'])}"
+            )
+    if not sections or "Risk Analysis" in sections:
+        lines.extend(["", "Risk Alerts"])
+        for alert in risk["alerts"]:
+            lines.append(f"- {alert['title']}: {alert['message']}")
+    if not sections or "Performance Analysis" in sections:
+        lines.extend(["", "Allocation"])
+        for item in dashboard["allocation"]:
+            lines.append(f"- {item['label']}: {item['value']}%")
+    lines.extend(["", AI_DISCLAIMER])
+    return lines
+
+
+def write_pdf_report(path: Path, lines: list[str]) -> None:
+    if canvas is None or letter is None:
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    pdf = canvas.Canvas(str(path), pagesize=letter)
+    width, height = letter
+    y = height - 54
+    for line in lines:
+        if y < 54:
+            pdf.showPage()
+            y = height - 54
+        pdf.drawString(54, y, line[:105])
+        y -= 18
+    pdf.save()
+
+
+def write_spreadsheet_report(path: Path, lines: list[str]) -> None:
+    if Workbook is None:
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "FinanceAI Report"
+    for index, line in enumerate(lines, start=1):
+        worksheet.cell(row=index, column=1, value=line)
+    workbook.save(path)
+
+
+def create_report_file(
+    connection: sqlite3.Connection,
+    report_id: int,
+    user: sqlite3.Row,
+    report_format: str,
+    sections: list[str],
+) -> tuple[str, str]:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    filename, content_type = generated_report_name(report_id, report_format)
+    path = REPORTS_DIR / filename
+    lines = report_lines(connection, user, sections)
+
+    if filename.endswith(".xlsx"):
+        write_spreadsheet_report(path, lines)
+    elif filename.endswith(".csv"):
+        with path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            for line in lines:
+                writer.writerow([line])
+    else:
+        write_pdf_report(path, lines)
+
+    return str(path), content_type
+
+
+def send_report_email(to_email: str, report_name: str) -> str:
+    if not RESEND_API_KEY:
+        return "queued_log_only"
+
+    body = json.dumps(
+        {
+            "from": REPORT_FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"Your FinanceAI report: {report_name}",
+            "html": f"<p>{report_name} is ready in your FinanceAI reports page.</p>",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return "sent"
+    except (urllib.error.URLError, TimeoutError):
+        return "queued_after_provider_error"
 
 
 def seed_demo_user(connection: sqlite3.Connection) -> None:
@@ -929,6 +1327,8 @@ def init_db() -> None:
                 report_format TEXT,
                 date_range TEXT,
                 sections TEXT,
+                file_path TEXT,
+                content_type TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
@@ -943,7 +1343,16 @@ def init_db() -> None:
             );
             """
         )
-        seed_demo_user(connection)
+        for statement in [
+            "ALTER TABLE reports ADD COLUMN file_path TEXT",
+            "ALTER TABLE reports ADD COLUMN content_type TEXT",
+        ]:
+            try:
+                connection.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+        if SEED_DEMO_DATA:
+            seed_demo_user(connection)
 
 
 @app.on_event("startup")
@@ -957,8 +1366,14 @@ def root() -> dict[str, str]:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "timestamp": utc_now_iso(), "database": DB_PATH.name}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "timestamp": utc_now_iso(),
+        "database": str(DB_PATH),
+        "ai_provider": "openai" if OPENAI_API_KEY else "local_rules",
+        "allowed_origins": ALLOWED_ORIGINS,
+    }
 
 
 @app.post("/api/auth/signup")
@@ -1104,27 +1519,63 @@ async def upload_transactions(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if filename.lower().endswith((".xlsx", ".xls")):
-            connection.execute(
-                """
-                INSERT INTO uploads (user_id, name, date_label, status, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    user["id"],
-                    filename,
-                    f"Uploaded {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
-                    "Reviewing",
-                    utc_now_iso(),
-                ),
-            )
-            connection.commit()
-            return {
-                "message": "Excel upload received. Review status has been added to recent uploads.",
-                "filename": filename,
-                "size_bytes": len(contents),
-            }
+            try:
+                parsed_rows = parse_excel_transactions(contents)
+                return insert_transactions(connection, user, parsed_rows, filename)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     raise HTTPException(status_code=400, detail="Only CSV, XLSX, and XLS files are supported.")
+
+
+@app.get("/api/transactions")
+def get_transactions(session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with get_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM transactions
+            WHERE user_id = ?
+            ORDER BY date DESC, id DESC
+            """,
+            (session["user"]["id"],),
+        ).fetchall()
+        return {"transactions": [transaction_payload(row) for row in rows]}
+
+
+@app.post("/api/transactions")
+def create_transaction(
+    payload: TransactionRequest,
+    session: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        try:
+            transaction = insert_single_transaction(connection, user, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "Transaction added and portfolio refreshed.", "transaction": transaction}
+
+
+@app.delete("/api/transactions/{transaction_id}")
+def delete_transaction(transaction_id: int, session: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM transactions WHERE id = ? AND user_id = ?",
+            (transaction_id, session["user"]["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Transaction not found.")
+
+        trade_value = float(row["quantity"]) * float(row["price"])
+        cash_delta = trade_value if row["type"] == "Buy" else -trade_value
+        connection.execute(
+            "UPDATE users SET cash_balance = cash_balance + ? WHERE id = ?",
+            (cash_delta, session["user"]["id"]),
+        )
+        connection.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+        connection.commit()
+    return {"message": "Transaction deleted and cash balance adjusted."}
 
 
 @app.get("/api/risk")
@@ -1160,6 +1611,50 @@ def add_to_watchlist(ticker: str, session: dict[str, Any] = Depends(current_user
     return {"message": f"{symbol} added to watchlist"}
 
 
+@app.post("/api/ai/portfolio-summary")
+def ai_portfolio_summary(session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        return call_openai_insight("portfolio_summary", ai_context(connection, user))
+
+
+@app.post("/api/ai/risk-explanation")
+def ai_risk_explanation(session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        return call_openai_insight("risk_explanation", ai_context(connection, user))
+
+
+@app.post("/api/ai/recommendations")
+def ai_recommendation_explanation(session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        return call_openai_insight("recommendation_explanation", ai_context(connection, user))
+
+
+@app.post("/api/ai/report-insights")
+def ai_report_insights(
+    payload: AIReportInsightRequest,
+    session: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        context = ai_context(connection, user)
+        context["report_request"] = {
+            "format": payload.format,
+            "date_range": payload.date_range,
+            "sections": payload.sections,
+        }
+        return call_openai_insight("report_insights", context)
+
+
+@app.post("/api/ai/chat")
+def ai_chat(payload: AIChatRequest, session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with get_db() as connection:
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        return call_openai_insight("chat", ai_context(connection, user), payload.question)
+
+
 @app.get("/api/reports")
 def get_reports(session: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with get_db() as connection:
@@ -1172,9 +1667,9 @@ def generate_report(
     session: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
     title = f"{payload.format} - {payload.date_range}"
-    meta = f"{datetime.now().date().isoformat()} | {max(1, len(payload.sections)) * 0.6:.1f} MB"
+    meta = f"{datetime.now().date().isoformat()} | {max(1, len(payload.sections)) * 0.2:.1f} MB"
     with get_db() as connection:
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO reports (user_id, title, meta, report_format, date_range, sections, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1189,17 +1684,56 @@ def generate_report(
                 utc_now_iso(),
             ),
         )
+        report_id = cursor.lastrowid
+        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user"]["id"],)).fetchone()
+        file_path, content_type = create_report_file(
+            connection,
+            report_id,
+            user,
+            payload.format,
+            payload.sections,
+        )
+        connection.execute(
+            "UPDATE reports SET file_path = ?, content_type = ? WHERE id = ?",
+            (file_path, content_type, report_id),
+        )
         connection.commit()
     return {
         "message": f"Report generated with {len(payload.sections)} sections.",
-        "report": {"title": title, "meta": meta},
+        "report": {"id": report_id, "title": title, "meta": meta, "content_type": content_type},
         "format": payload.format,
         "sections": payload.sections,
     }
 
 
+@app.get("/api/reports/{report_id}/download")
+def download_report(report_id: int, session: dict[str, Any] = Depends(current_user)) -> FileResponse:
+    with get_db() as connection:
+        report = connection.execute(
+            """
+            SELECT title, file_path, content_type
+            FROM reports
+            WHERE id = ? AND user_id = ?
+            """,
+            (report_id, session["user"]["id"]),
+        ).fetchone()
+    if not report or not report["file_path"]:
+        raise HTTPException(status_code=404, detail="Report file not found.")
+
+    path = Path(report["file_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file is no longer available.")
+
+    return FileResponse(
+        path=path,
+        media_type=report["content_type"] or "application/octet-stream",
+        filename=path.name,
+    )
+
+
 @app.post("/api/reports/email")
 def email_report(payload: EmailReportRequest, session: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+    delivery_status = send_report_email(payload.email, payload.report_name)
     with get_db() as connection:
         connection.execute(
             """
@@ -1209,4 +1743,6 @@ def email_report(payload: EmailReportRequest, session: dict[str, Any] = Depends(
             (session["user"]["id"], payload.email, payload.report_name, utc_now_iso()),
         )
         connection.commit()
-    return {"message": f"{payload.report_name} queued for delivery to {payload.email}"}
+    if delivery_status == "sent":
+        return {"message": f"{payload.report_name} sent to {payload.email}"}
+    return {"message": f"{payload.report_name} queued for delivery to {payload.email} ({delivery_status})"}

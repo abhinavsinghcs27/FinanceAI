@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest-cache-files-*/
+backend/tests/test_financeai.db
+backend/generated_reports/
+backend/logs/*dev*.log
+frontend/logs/
