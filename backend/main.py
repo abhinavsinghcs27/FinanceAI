@@ -1420,10 +1420,10 @@ def signup(payload: SignupRequest) -> dict[str, Any]:
             for txn in DEFAULT_TRANSACTIONS:
                 connection.execute(
                     """
-                    INSERT INTO transactions (user_id, date, type, symbol, quantity, price, created_at)
+                    INSERT INTO transactions (user_id, date, type, symbol, quantity, price, source)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (user_id, txn["date"], txn["type"], txn["symbol"], txn["quantity"], txn["price"], utc_now_iso()),
+                    (user_id, txn["date"], txn["type"], txn["symbol"], txn["quantity"], txn["price"], "Demo Seed"),
                 )
 
         token = create_session(connection, user_id)
