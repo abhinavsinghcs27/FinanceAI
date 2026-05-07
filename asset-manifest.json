@@ -1,0 +1,15 @@
+{
+  "files": {
+    "main.css": "/FinanceAI/static/css/main.33a0fe30.css",
+    "main.js": "/FinanceAI/static/js/main.ad24a673.js",
+    "static/js/453.64aababc.chunk.js": "/FinanceAI/static/js/453.64aababc.chunk.js",
+    "index.html": "/FinanceAI/index.html",
+    "main.33a0fe30.css.map": "/FinanceAI/static/css/main.33a0fe30.css.map",
+    "main.ad24a673.js.map": "/FinanceAI/static/js/main.ad24a673.js.map",
+    "453.64aababc.chunk.js.map": "/FinanceAI/static/js/453.64aababc.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.33a0fe30.css",
+    "static/js/main.ad24a673.js"
+  ]
+}
