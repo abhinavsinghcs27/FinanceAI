@@ -1415,6 +1415,17 @@ def signup(payload: SignupRequest) -> dict[str, Any]:
             """,
             (user_id, "welcome_template.csv", "Ready for your first import", "Pending", utc_now_iso()),
         )
+        
+        if SEED_DEMO_DATA:
+            for txn in DEFAULT_TRANSACTIONS:
+                connection.execute(
+                    """
+                    INSERT INTO transactions (user_id, date, type, symbol, quantity, price, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, txn["date"], txn["type"], txn["symbol"], txn["quantity"], txn["price"], utc_now_iso()),
+                )
+
         token = create_session(connection, user_id)
         user = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
