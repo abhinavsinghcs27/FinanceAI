@@ -86,6 +86,10 @@ function ReportsPage() {
         recent: [result.report, ...current.recent],
       }));
       setMessage(result.message);
+      
+      // Automatically download the report after it's generated
+      await downloadReport(result.report);
+
       requestJson("/api/ai/report-insights", {
         method: "POST",
         body: JSON.stringify({
